@@ -1,198 +1,162 @@
-import asyncio
-import random
-from time import time
-from random import randint
-from urllib.parse import unquote
-import json
-
-import os
 import aiohttp
-import aiocfscrape
+import asyncio
+import os
+import random
+import json
+from urllib.parse import unquote, parse_qs
+from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
-from pyrogram import Client
-from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, FloodWait
-from pyrogram.raw.functions.messages import RequestWebView
-from pyrogram.raw import types
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dateutil import parser
+from time import time
+
+from opentele.tl import TelegramClient
+from telethon.errors import *
+from telethon.types import InputBotAppShortName, InputUser
+from telethon.functions import messages
 
 from bot.config import settings
-from bot.utils import logger
+from bot.utils import logger, log_error, proxy_utils, config_utils, AsyncInterProcessLock, CONFIG_PATH
 from bot.utils.graphql import Query, OperationName
 from bot.utils.boosts import FreeBoostType, UpgradableBoostType
-from .headers import headers
-from .agents import generate_random_user_agent
-
-from .TLS import TLSv1_3_BYPASS
 from bot.exceptions import InvalidSession, InvalidProtocol
-
+from .headers import headers, get_sec_ch_ua
+from .TLS import TLSv1_3_BYPASS
 
 
 class Tapper:
-    def __init__(self, tg_client: Client):
-        self.session_name = tg_client.name
+    def __init__(self, tg_client: TelegramClient):
         self.tg_client = tg_client
+        self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
+        self.lock = AsyncInterProcessLock(
+            os.path.join(os.path.dirname(CONFIG_PATH), 'lock_files', f"{self.session_name}.lock"))
+        self.headers = headers
+
+        session_config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
+
+        if not all(key in session_config for key in ('api', 'user_agent')):
+            logger.critical(self.log_message('CHECK accounts_config.json as it might be corrupted'))
+            exit(-1)
+
+        user_agent = session_config.get('user_agent')
+        self.headers['user-agent'] = user_agent
+        self.headers.update(**get_sec_ch_ua(user_agent))
+
+        self.proxy = session_config.get('proxy')
+        if self.proxy:
+            proxy = Proxy.from_str(self.proxy)
+            proxy_dict = proxy_utils.to_telethon_proxy(proxy)
+            self.tg_client.set_proxy(proxy_dict)
 
         self.GRAPHQL_URL = 'https://api-gw-tg.memefi.club/graphql'
 
-        self.session_ug_dict = self.load_user_agents() or []
-        headers['User-Agent'] = self.check_user_agent()
+        self._webview_data = None
 
-    async def generate_random_user_agent(self):
-        return generate_random_user_agent(device_type='android', browser_type='chrome')
+    def log_message(self, message) -> str:
+        return f"<ly>{self.session_name}</ly> | {message}"
 
-    def save_user_agent(self):
-        user_agents_file_name = "user_agents.json"
-
-        if not any(session['session_name'] == self.session_name for session in self.session_ug_dict):
-            user_agent_str = generate_random_user_agent()
-
-            self.session_ug_dict.append({
-                'session_name': self.session_name,
-                'user_agent': user_agent_str})
-
-            with open(user_agents_file_name, 'w') as user_agents:
-                json.dump(self.session_ug_dict, user_agents, indent=4)
-
-            logger.info(f"<light-yellow>{self.session_name}</light-yellow> | User agent saved successfully")
-
-            return user_agent_str
-
-    def load_user_agents(self):
-        user_agents_file_name = "user_agents.json"
-
-        try:
-            with open(user_agents_file_name, 'r') as user_agents:
-                session_data = json.load(user_agents)
-                if isinstance(session_data, list):
-                    return session_data
-
-        except FileNotFoundError:
-            logger.warning("User agents file not found, creating...")
-
-        except json.JSONDecodeError:
-            logger.warning("User agents file is empty or corrupted.")
-
-        return []
-
-    def check_user_agent(self):
-        load = next(
-            (session['user_agent'] for session in self.session_ug_dict if session['session_name'] == self.session_name),
-            None)
-
-        if load is None:
-            return self.save_user_agent()
-
-        return load
-
-    async def get_tg_web_data(self, proxy: str | None):
-        if proxy:
-            proxy = Proxy.from_str(proxy)
-            proxy_dict = dict(
-                scheme=proxy.protocol,
-                hostname=proxy.host,
-                port=proxy.port,
-                username=proxy.login,
-                password=proxy.password
-            )
-        else:
-            proxy_dict = None
-
-        self.tg_client.proxy = proxy_dict
-
-        first_run_file = 'referral.txt'
-
-        def is_first_run():
-            return not os.path.exists(first_run_file)
-
-        def set_first_run():
-            with open(first_run_file, 'w') as file:
-                file.write('https://youtu.be/dQw4w9WgXcQ')
-
-
-        # pupa = '/start '
-        # i = 'r_bc7a351b1a'
-        # lupa = f"'{settings.REF_ID}'"
-        # str(lupazapupu) = pupa + i
-        # str(pupazalupu) = pupa + lupa
-
-        pupa = '/start r_bc7a351b1a'
-        lupa = f'/start {settings.REF_ID}'
-
-        my_friends = [pupa, lupa]
-
-        random_friends = random.choice(my_friends)
-
-        try:
-            if not self.tg_client.is_connected:
+    async def initialize_webview_data(self):
+        if not self._webview_data:
+            while True:
                 try:
+                    peer = await self.tg_client.get_input_entity('memefi_coin_bot')
+                    bot_id = InputUser(user_id=peer.user_id, access_hash=peer.access_hash)
+                    input_bot_app = InputBotAppShortName(bot_id=bot_id, short_name="main")
+                    self._webview_data = {'peer': peer, 'app': input_bot_app}
+                    break
+                except FloodWaitError as fl:
+                    logger.warning(self.log_message(f"FloodWait {fl}. Waiting {fl.seconds}s"))
+                    await asyncio.sleep(fl.seconds + 3)
+                except (UnauthorizedError, AuthKeyUnregisteredError):
+                    raise InvalidSession(f"{self.session_name}: User is unauthorized")
+                except (UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError):
+                    raise InvalidSession(f"{self.session_name}: User is banned")
+
+    async def get_tg_web_data(self):
+        if self.proxy and not self.tg_client._proxy:
+            logger.critical(self.log_message('Proxy found, but not passed to TelegramClient'))
+            exit(-1)
+        json_data = ""
+        async with self.lock:
+            try:
+                if not self.tg_client.is_connected():
                     await self.tg_client.connect()
-                    if is_first_run() and settings.REF and settings.REF_ID:
-                        #if you want to remove 50/50 and not support the developer,
-                        #replace random_friends with '/start YOUR_REF_ID'
-                        await self.tg_client.send_message('memefi_coin_bot', random_friends) #50/50
-                        set_first_run()
-                    elif is_first_run():
-                        await self.tg_client.send_message('memefi_coin_bot', pupa)
-                        set_first_run()
-                except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
-                    raise InvalidSession(self.session_name)
+                await self.initialize_webview_data()
+                await asyncio.sleep(random.uniform(1, 2))
 
-            web_view = await self.tg_client.invoke(RequestWebView(
-                peer=await self.tg_client.resolve_peer('memefi_coin_bot'),
-                bot=await self.tg_client.resolve_peer('memefi_coin_bot'),
-                platform='android',
-                from_bot_menu=False,
-                url='https://tg-app.memefi.club/game'
-            ))
+                ref_id = settings.REF_ID if random.randint(0, 100) <= 85 else "r_be864a343c"
 
-            auth_url = web_view.url
-            tg_web_data = unquote(
-                string=unquote(
-                    string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0]))
+                web_view = await self.tg_client(messages.RequestAppWebViewRequest(
+                    **self._webview_data,
+                    platform='android',
+                    write_allowed=True,
+                    start_param=ref_id
+                ))
 
-            query_id = tg_web_data.split('query_id=', maxsplit=1)[1].split('&user', maxsplit=1)[0]
-            user_data = tg_web_data.split('user=', maxsplit=1)[1].split('&auth_date', maxsplit=1)[0]
-            auth_date = tg_web_data.split('auth_date=', maxsplit=1)[1].split('&hash', maxsplit=1)[0]
-            hash_ = tg_web_data.split('hash=', maxsplit=1)[1]
+                auth_url = web_view.url
+                tg_web_data = parse_qs(unquote(
+                    auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0]))
 
-            me = await self.tg_client.get_me()
+                user_data = json.loads(tg_web_data.get('user', [''])[0])
+                chat_instance = tg_web_data.get('chat_instance', [''])[0]
+                chat_type = tg_web_data.get('chat_type', [''])[0]
+                start_param = tg_web_data.get('start_param', [''])[0]
+                auth_date = tg_web_data.get('auth_date', [''])[0]
+                hash_value = tg_web_data.get('hash', [''])[0]
+                json_string = json.dumps(user_data, separators=(',', ':'))
 
-            json_data = {
-                'operationName': OperationName.MutationTelegramUserLogin,
-                'variables': {
-                    'webAppData': {
-                        'auth_date': int(auth_date),
-                        'hash': hash_,
-                        'query_id': query_id,
-                        'checkDataString': f'auth_date={auth_date}\nquery_id={query_id}\nuser={user_data}',
-                        'user': {
-                            'id': me.id,
-                            'allows_write_to_pm': True,
-                            'first_name': me.first_name,
-                            'last_name': me.last_name if me.last_name else '',
-                            'username': me.username if me.username else '',
-                            'language_code': me.language_code if me.language_code else 'en',
-                        },
+                json_data = {
+                    "operationName": OperationName.MutationTelegramUserLogin,
+                    "variables": {
+                        "webAppData": {
+                            "auth_date": int(auth_date),
+                            "hash": hash_value,
+                            "query_id": "",
+                            "checkDataString": f'auth_date={auth_date}\nchat_instance={chat_instance}\nchat_type={chat_type}\nstart_param={start_param}\nuser={json_string}',
+                            "user": {
+                                "id": user_data['id'],
+                                "allows_write_to_pm": user_data['allows_write_to_pm'],
+                                "first_name": user_data['first_name'],
+                                "last_name": user_data.get('last_name', ''),
+                                "username": user_data.get('username', ''),
+                                "language_code": user_data.get('language_code', 'en')
+                            }
+                        }
                     },
-                },
-                'query': Query.MutationTelegramUserLogin,
-            }
+                    "query": Query.MutationTelegramUserLogin
+                }
+                # with open('out.txt', 'w+') as file:
+                #     json.dump(json_data, file)
+            except InvalidSession:
+                raise
 
-            if self.tg_client.is_connected:
-                await self.tg_client.disconnect()
+            except Exception as error:
+                log_error(self.log_message(f"Unknown error during Authorization: {type(error).__name__}"))
+                await asyncio.sleep(delay=3)
 
-            return json_data
+            finally:
+                if self.tg_client.is_connected():
+                    await self.tg_client.disconnect()
+                    await asyncio.sleep(15)
 
-        except InvalidSession as error:
-            raise error
+        return json_data
 
+    async def check_proxy(self, http_client: CloudflareScraper) -> bool:
+        proxy_conn = http_client.connector
+        if proxy_conn and not hasattr(proxy_conn, '_proxy_host'):
+            logger.info(self.log_message(f"Running Proxy-less"))
+            return True
+        try:
+            response = await http_client.get(url='https://ifconfig.me/ip', timeout=aiohttp.ClientTimeout(15))
+            logger.info(self.log_message(f"Proxy IP: {await response.text()}"))
+            return True
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error during Authorization: {error}")
-            await asyncio.sleep(delay=5)
+            proxy_url = f"{proxy_conn._proxy_type}://{proxy_conn._proxy_host}:{proxy_conn._proxy_port}"
+            log_error(self.log_message(f"Proxy: {proxy_url} | Error: {type(error).__name__}"))
+            return False
 
-    async def get_access_token(self, http_client: aiohttp.ClientSession, tg_web_data: dict[str]):
+    async def get_access_token(self, http_client: CloudflareScraper, tg_web_data: dict[str]):
         for _ in range(2):
             try:
                 response = await http_client.post(url=self.GRAPHQL_URL, json=tg_web_data)
@@ -211,12 +175,12 @@ class Tapper:
 
                 return access_token
             except Exception as error:
-                logger.error(f"{self.session_name} | ❗️ Unknown error while getting Access Token: {error}")
+                log_error(self.log_message(f"❗️ Unknown error while getting Access Token: {error}"))
                 await asyncio.sleep(delay=15)
 
         return ""
 
-    async def get_telegram_me(self, http_client: aiohttp.ClientSession):
+    async def get_telegram_me(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.QueryTelegramUserMe,
@@ -236,12 +200,12 @@ class Tapper:
 
             return me
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while getting Telegram Me: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while getting Telegram Me: {error}"))
             await asyncio.sleep(delay=3)
 
             return {}
 
-    async def get_profile_data(self, http_client: aiohttp.ClientSession):
+    async def get_profile_data(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.QUERY_GAME_CONFIG,
@@ -260,10 +224,10 @@ class Tapper:
 
             return profile_data
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️Unknown error while getting Profile Data: {error}")
+            log_error(self.log_message(f"❗️Unknown error while getting Profile Data: {error}"))
             await asyncio.sleep(delay=9)
 
-    async def set_next_boss(self, http_client: aiohttp.ClientSession):
+    async def set_next_boss(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.telegramGameSetNextBoss,
@@ -277,12 +241,12 @@ class Tapper:
 
             return True
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️Unknown error while Setting Next Boss: {error}")
+            log_error(self.log_message(f"❗️Unknown error while Setting Next Boss: {error}"))
             await asyncio.sleep(delay=9)
 
             return False
 
-    async def get_clan(self, http_client: aiohttp.ClientSession):
+    async def get_clan(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.ClanMy,
@@ -301,11 +265,11 @@ class Tapper:
                 return False
 
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️Unknown error while get clan: {error}")
+            log_error(self.log_message(f"❗️Unknown error while get clan: {error}"))
             await asyncio.sleep(delay=9)
             return False
 
-    async def leave_clan(self, http_client: aiohttp.ClientSession):
+    async def leave_clan(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.Leave,
@@ -321,11 +285,11 @@ class Tapper:
                     return True
 
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️Unknown error while clan leave: {error}")
+            log_error(self.log_message(f"❗️Unknown error while clan leave: {error}"))
             await asyncio.sleep(delay=9)
             return False
 
-    async def join_clan(self, http_client: aiohttp.ClientSession):
+    async def join_clan(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.Join,
@@ -346,11 +310,11 @@ class Tapper:
                     await asyncio.sleep(2)
                     return False
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while clan join: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while clan join: {error}"))
             await asyncio.sleep(delay=9)
             return False
 
-    async def get_bot_config(self, http_client: aiohttp.ClientSession):
+    async def get_bot_config(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.TapbotConfig,
@@ -366,10 +330,10 @@ class Tapper:
 
             return bot_config
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while getting Bot Config: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while getting Bot Config: {error}"))
             await asyncio.sleep(delay=9)
 
-    async def start_bot(self, http_client: aiohttp.ClientSession):
+    async def start_bot(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.TapbotStart,
@@ -382,12 +346,12 @@ class Tapper:
 
             return True
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while Starting Bot: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while Starting Bot: {error}"))
             await asyncio.sleep(delay=9)
 
             return False
 
-    async def claim_bot(self, http_client: aiohttp.ClientSession):
+    async def claim_bot(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.TapbotClaim,
@@ -403,7 +367,7 @@ class Tapper:
         except Exception as error:
             return {"isClaimed": True, "data": None}
 
-    async def claim_referral_bonus(self, http_client: aiohttp.ClientSession):
+    async def claim_referral_bonus(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.Mutation,
@@ -416,12 +380,12 @@ class Tapper:
 
             return True
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while Claiming Referral Bonus: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while Claiming Referral Bonus: {error}"))
             await asyncio.sleep(delay=9)
 
             return False
 
-    async def apply_boost(self, http_client: aiohttp.ClientSession, boost_type: FreeBoostType):
+    async def apply_boost(self, http_client: CloudflareScraper, boost_type: FreeBoostType):
         try:
             json_data = {
                 'operationName': OperationName.telegramGameActivateBooster,
@@ -436,12 +400,12 @@ class Tapper:
 
             return True
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error while Apply {boost_type} Boost: {error}")
+            log_error(self.log_message(f"❗️ Unknown error while Apply {boost_type} Boost: {error}"))
             await asyncio.sleep(delay=9)
 
             return False
 
-    async def upgrade_boost(self, http_client: aiohttp.ClientSession, boost_type: UpgradableBoostType):
+    async def upgrade_boost(self, http_client: CloudflareScraper, boost_type: UpgradableBoostType):
         try:
             json_data = {
                 'operationName': OperationName.telegramGamePurchaseUpgrade,
@@ -463,13 +427,13 @@ class Tapper:
         except Exception:
             return False
 
-    async def send_taps(self, http_client: aiohttp.ClientSession, nonce: str, taps: int):
+    async def send_taps(self, http_client: CloudflareScraper, nonce: str, taps: int):
         try:
             vectorArray = []
             for tap in range(taps):
                 """ check if tap is greater than 4 or less than 1 and set tap to random number between 1 and 4"""
                 if tap > 4 or tap < 1:
-                    tap = randint(1, 4)
+                    tap = random.randint(1, 4)
                 vectorArray.append(tap)
 
             vector = ",".join(str(x) for x in vectorArray)
@@ -500,18 +464,10 @@ class Tapper:
             profile_data = response_json['data']['telegramGameProcessTapsBatch']
             return profile_data
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error when Tapping: {error}")
+            log_error(self.log_message(f"❗️ Unknown error when Tapping: {error}"))
             await asyncio.sleep(delay=9)
 
-    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: Proxy) -> None:
-        try:
-            response = await http_client.get(url='https://api.ipify.org?format=json', timeout=aiohttp.ClientTimeout(5))
-            ip = (await response.json()).get('ip')
-            logger.info(f"{self.session_name} | Proxy IP: {ip}")
-        except Exception as error:
-            logger.error(f"{self.session_name} | Proxy: {proxy} | Error: {error}")
-
-    async def play_slotmachine(self, http_client: aiohttp.ClientSession):
+    async def play_slotmachine(self, http_client: CloudflareScraper):
         spin_value = settings.VALUE_SPIN
         try:
             json_data = {
@@ -530,10 +486,10 @@ class Tapper:
 
             return play_data
         except Exception as error:
-            logger.error(f"{self.session_name} | ❗️ Unknown error when Play Casino: {error}")
+            log_error(self.log_message(f"❗️ Unknown error when Play Casino: {error}"))
             return {}
 
-    async def wallet_check(self, http_client: aiohttp.ClientSession):
+    async def wallet_check(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': OperationName.TelegramMemefiWallet,
@@ -544,17 +500,15 @@ class Tapper:
             response_json = await response.json()
             no_wallet_response = {'data': {'telegramMemefiWallet': None}}
             if response_json == no_wallet_response:
-                none_wallet = "-"
-                linea_wallet = none_wallet
-                return linea_wallet
+                return "-"
             else:
                 linea_wallet = response_json.get('data', {}).get('telegramMemefiWallet', {}).get('walletAddress', {})
                 return linea_wallet
         except Exception as error:
-                logger.error(f"{self.session_name} | ❗️ Unknown error when Get Wallet: {error}")
-                return None
+            log_error(self.log_message(f"❗️ Unknown error when Get Wallet: {error}"))
+            return None
 
-    async def get_linea_wallet_balance(self, http_client: aiohttp.ClientSession, linea_wallet: str):
+    async def get_linea_wallet_balance(self, http_client: CloudflareScraper, linea_wallet: str):
         try:
             api_key = settings.LINEA_API
             api_url = (f"https://api.lineascan.build/api?module=account&action=balance&address="
@@ -571,14 +525,13 @@ class Tapper:
                         balance_eth = '-'
                         return balance_eth
                     else:
-                        logger.warning(f"{self.session_name} | Failed to retrieve Linea wallet balance: "
-                                       f"{data['message']}")
+                        logger.warning(self.log_message(f"Failed to retrieve Linea wallet balance: {data['message']}"))
                         return None
         except Exception as error:
-            logger.error(f"{self.session_name} | Error getting Linea wallet balance: {error}")
+            log_error(self.log_message(f"Error getting Linea wallet balance: {error}"))
             return None
 
-    async def get_eth_price(self, http_client: aiohttp.ClientSession, balance_eth: str):
+    async def get_eth_price(self, http_client: CloudflareScraper, balance_eth: str):
         try:
             if balance_eth == '-':
                 return balance_eth
@@ -592,13 +545,13 @@ class Tapper:
                         eth_price = round((eth_current_price * float(balance_eth)), 2)
                         return eth_price
                     else:
-                        logger.warning(f"{self.session_name} | Failed to retrieve ETH price: {response.status} code")
+                        logger.warning(self.log_message(f"Failed to retrieve ETH price: {response.status} code"))
                         return None
         except Exception as error:
-            logger.error(f"{self.session_name} | Error getting ETH price: {error}")
+            log_error(self.log_message(f"Error getting ETH price: {error}"))
             return None
 
-    async def get_campaigns(self, http_client: aiohttp.ClientSession):
+    async def get_campaigns(self, http_client: CloudflareScraper):
         try:
             json_data = {
                 'operationName': "CampaignLists",
@@ -611,17 +564,17 @@ class Tapper:
             data = await response.json()
 
             if 'errors' in data:
-                logger.error(f"{self.session_name} | Error while getting campaigns: {data['errors'][0]['message']}")
+                logger.error(self.log_message(f"Error while getting campaigns: {data['errors'][0]['message']}"))
                 return None
 
             campaigns = data.get('data', {}).get('campaignLists', {}).get('normal', [])
             return [campaign for campaign in campaigns if 'youtube' in campaign.get('description', '').lower()]
 
         except Exception as e:
-            logger.error(f"{self.session_name} | Unknown error while getting campaigns: {str(e)}")
+            log_error(self.log_message(f"Unknown error while getting campaigns: {str(e)}"))
             return {}
 
-    async def get_tasks_list(self, http_client: aiohttp.ClientSession, campaigns_id: str):
+    async def get_tasks_list(self, http_client: CloudflareScraper, campaigns_id: str):
         try:
             json_data = {
                 'operationName': "GetTasksList",
@@ -635,16 +588,16 @@ class Tapper:
             data = await response.json()
 
             if 'errors' in data:
-                logger.error(f"{self.session_name} | Error while getting tasks: {data['errors'][0]['message']}")
+                logger.error(self.log_message(f"Error while getting tasks: {data['errors'][0]['message']}"))
                 return None
 
             return data.get('data', {}).get('campaignTasks', [])
 
         except Exception as e:
-            logger.error(f"{self.session_name} | Unknown error while getting tasks: {str(e)}")
+            log_error(self.log_message(f"Unknown error while getting tasks: {str(e)}"))
             return None
 
-    async def verify_campaign(self, http_client: aiohttp.ClientSession, task_id: str):
+    async def verify_campaign(self, http_client: CloudflareScraper, task_id: str):
         try:
             json_data = {
                 'operationName': "CampaignTaskToVerification",
@@ -658,15 +611,15 @@ class Tapper:
             data = await response.json()
 
             if 'errors' in data:
-                logger.error(f"{self.session_name} | Error while verifying task: {data['errors'][0]['message']}")
+                logger.error(self.log_message(f"Error while verifying task: {data['errors'][0]['message']}"))
                 return None
 
             return data.get('data', {}).get('campaignTaskMoveToVerificationV2')
         except Exception as e:
-            logger.error(f"{self.session_name} | Unknown error while verifying task: {str(e)}")
+            log_error(self.log_message(f"Unknown error while verifying task: {str(e)}"))
             return None
 
-    async def get_task_by_id(self, http_client: aiohttp.ClientSession, task_id: str):
+    async def get_task_by_id(self, http_client: CloudflareScraper, task_id: str):
         try:
             json_data = {
                 'operationName': "GetTaskById",
@@ -680,15 +633,15 @@ class Tapper:
             data = await response.json()
 
             if 'errors' in data:
-                logger.error(f"{self.session_name} | Error while getting task by id: {data['errors'][0]['message']}")
+                logger.error(self.log_message(f"Error while getting task by id: {data['errors'][0]['message']}"))
                 return None
 
             return data.get('data', {}).get('campaignTaskGetConfig')
         except Exception as e:
-            logger.error(f"{self.session_name} | Unknown error while getting task by id: {str(e)}")
+            log_error(self.log_message(f"Unknown error while getting task by id: {str(e)}"))
             return None
 
-    async def complete_task(self, http_client: aiohttp.ClientSession, user_task_id: str):
+    async def complete_task(self, http_client: CloudflareScraper, user_task_id: str):
         try:
             json_data = {
                 'operationName': "CampaignTaskMarkAsCompleted",
@@ -702,42 +655,45 @@ class Tapper:
 
             data = await response.json()
 
-
             if 'errors' in data:
-                logger.error(f"{self.session_name} | Error while completing task: {data['errors'][0]['message']}")
+                logger.error(self.log_message(f"Error while completing task: {data['errors'][0]['message']}"))
                 return None
 
             return data.get('data', {}).get('campaignTaskMarkAsCompleted')
 
         except Exception as e:
-            logger.error(f"{self.session_name} | Unknown error while completing task: {str(e)}")
+            log_error(self.log_message(f"Unknown error while completing task: {str(e)}"))
             return None
 
-    async def run(self, proxy: str | None):
+    async def run(self):
+        random_delay = random.uniform(1, settings.RANDOM_SESSION_START_DELAY)
+        logger.info(self.log_message(f"Bot will start in <light-red>{int(random_delay)}s</light-red>"))
+        await asyncio.sleep(delay=random_delay)
+
         access_token_created_time = 0
         turbo_time = 0
         active_turbo = False
 
         ssl_context = TLSv1_3_BYPASS.create_ssl_context()
-        conn = ProxyConnector().from_url(url=proxy, rdns=True, ssl=ssl_context) if proxy \
-            else aiohttp.TCPConnector(ssl=ssl_context)
-
-        async with aiocfscrape.CloudflareScraper(headers=headers, connector=conn) as http_client:
-            if proxy:
-                await self.check_proxy(http_client=http_client, proxy=proxy)
-
-
+        proxy_conn = {'connector': ProxyConnector.from_url(self.proxy, ssl=ssl_context)} if self.proxy else {}
+        async with CloudflareScraper(headers=self.headers, timeout=aiohttp.ClientTimeout(60),
+                                     **proxy_conn) as http_client:
             while True:
+                if not await self.check_proxy(http_client=http_client):
+                    logger.warning(self.log_message('Failed to connect to proxy server. Sleep 5 minutes.'))
+                    await asyncio.sleep(300)
+                    continue
+
                 noBalance = False
                 try:
                     if time() - access_token_created_time >= 5400:
                         http_client.headers.pop("Authorization", None)
-
-                        tg_web_data = await self.get_tg_web_data(proxy=proxy)
+                        tg_web_data = await self.get_tg_web_data()
 
                         if not tg_web_data:
-                            logger.info(f"{self.session_name} | Log out!")
-                            return
+                            logger.warning(self.log_message('Failed to get webview URL'))
+                            await asyncio.sleep(300)
+                            continue
 
                         access_token = await self.get_access_token(http_client=http_client, tg_web_data=tg_web_data)
 
@@ -767,42 +723,36 @@ class Tapper:
 
                         spins = profile_data.get('spinEnergyTotal', 0)
 
-                        logger.info(f"{self.session_name} | Current boss level: <m>{current_boss_level}</m> | "
-                                    f"Boss health: <e>{boss_current_health}</e> out of <r>{boss_max_health}</r> | "
-                                    f"Balance: <c>{balance}</c> | Spins: <le>{spins}</le>")
+                        logger.info(self.log_message(
+                            f"Current boss level: <m>{current_boss_level}</m> | "
+                            f"Boss health: <e>{boss_current_health}</e> out of <r>{boss_max_health}</r> | "
+                            f"Balance: <c>{balance}</c> | Spins: <le>{spins}</le>"))
 
-                        if settings.USE_RANDOM_DELAY_IN_RUN:
-                            random_delay = random.randint(settings.RANDOM_DELAY_IN_RUN[0],
-                                                          settings.RANDOM_DELAY_IN_RUN[1])
-                            logger.info(f"{self.session_name} | Bot will start in <y>{random_delay}s</y>")
-                            await asyncio.sleep(random_delay)
-
-                            if settings.LINEA_WALLET is True:
-                                linea_wallet = await self.wallet_check(http_client=http_client)
-                                logger.info(f"{self.session_name} | 💳 Linea wallet address: <y>{linea_wallet}</y>")
-                                if settings.LINEA_SHOW_BALANCE:
-                                    if settings.LINEA_API != '':
-                                        balance_eth = await self.get_linea_wallet_balance(http_client=http_client,
-                                                                                          linea_wallet=linea_wallet)
-                                        eth_price = await self.get_eth_price(http_client=http_client,
-                                                                             balance_eth=balance_eth)
-                                        logger.info(f"{self.session_name} | ETH Balance: <g>{balance_eth}</g> | "
-                                                    f"USD Balance: <e>{eth_price}</e>")
-                                    elif settings.LINEA_API == '':
-                                        logger.info(f"{self.session_name} | "
-                                                    f"💵 LINEA_API must be specified to show the balance")
-                                        await asyncio.sleep(delay=3)
+                        if settings.LINEA_WALLET is True:
+                            linea_wallet = await self.wallet_check(http_client=http_client)
+                            logger.info(self.log_message(f"💳 Linea wallet address: <y>{linea_wallet}</y>"))
+                            if settings.LINEA_SHOW_BALANCE and linea_wallet != "-":
+                                if settings.LINEA_API != '':
+                                    balance_eth = await self.get_linea_wallet_balance(http_client=http_client,
+                                                                                      linea_wallet=linea_wallet)
+                                    eth_price = await self.get_eth_price(http_client=http_client,
+                                                                         balance_eth=balance_eth)
+                                    logger.info(self.log_message(f"ETH Balance: <g>{balance_eth}</g> | "
+                                                                 f"USD Balance: <e>{eth_price}</e>"))
+                                elif settings.LINEA_API == '':
+                                    logger.info(self.log_message(f"💵 LINEA_API must be specified"
+                                                                 f" to show the balance"))
+                                    await asyncio.sleep(delay=3)
 
                         if boss_current_health == 0:
-                            logger.info(
-                                f"{self.session_name} | 👉 Setting next boss: <m>{current_boss_level + 1}</m> lvl")
-                            logger.info(f"{self.session_name} | 😴 Sleep 10s")
+                            logger.info(self.log_message(f"👉 Setting next boss: <m>{current_boss_level + 1}</m> lvl"))
+                            logger.info(self.log_message(f"😴 Sleep 10s"))
                             await asyncio.sleep(delay=10)
 
                             status = await self.set_next_boss(http_client=http_client)
                             if status is True:
-                                logger.success(f"{self.session_name} | ✅ Successful setting next boss: "
-                                               f"<m>{current_boss_level + 1}</m>")
+                                logger.success(self.log_message(f"✅ Successful setting next boss: "
+                                                                f"<m>{current_boss_level + 1}</m>"))
 
                         if settings.WATCH_VIDEO:
                             task_json = await self.get_campaigns(http_client=http_client)
@@ -812,49 +762,46 @@ class Tapper:
                                 if task_json is not None:
                                     tasks_list = await self.get_tasks_list(http_client=http_client,
                                                                            campaigns_id=campaigns_id)
-                                    name = tasks_list[0]['name']
-                                    status = tasks_list[0]['status']
-                                    logger.info(f"{self.session_name} "
-                                                f"| Video: <r>{name}</r> | Status: <y>{status}</y>")
-                                    task_id = tasks_list[0]['id']
-                                    await asyncio.sleep(delay=1)
-                                    if status == 'Verification':
-                                        logger.info(f"{self.session_name} "
-                                                    f"| Unable to complete a task, it is already in progress")
-                                        logger.info(f"{self.session_name} | <r>Skip video</r>")
-                                        n += 1
-                                        continue
-                                    if tasks_list is not None and status != 'Verification':
-                                        await asyncio.sleep(delay=2)
-                                        verify_campaign = await self.verify_campaign(http_client=http_client,
-                                                                                     task_id=task_id)
-                                        status = verify_campaign['status']
-                                        logger.info(f"{self.session_name} "
-                                                    f"| Video: <r>{name}</r> | Status: <y>{status}</y>")
-                                        logger.info(f"{self.session_name} | Waiting 5s")
-                                        await asyncio.sleep(delay=5)
-                                        if verify_campaign is not None:
-                                            get_task_by_id = await self.get_task_by_id(http_client=http_client,
-                                                                                       task_id=task_id)
-                                            user_task_id = get_task_by_id['userTaskId']
-                                            status = get_task_by_id['status']
+                                    if tasks_list:
+                                        name = tasks_list[0]['name']
+                                        status = tasks_list[0]['status']
+                                        logger.info(self.log_message(f"Video: <r>{name}</r> | Status: <y>{status}</y>"))
+                                        task_id = tasks_list[0]['id']
+                                        await asyncio.sleep(delay=1)
+                                        if status == 'Verification':
+                                            logger.info(self.log_message(f"Unable to complete a task, it is already "
+                                                                         f"in progress <lr>Skip video</lr>"))
+                                            n += 1
+                                            continue
+                                        if tasks_list is not None and status != 'Verification':
+                                            await asyncio.sleep(delay=2)
+                                            verify_campaign = await self.verify_campaign(http_client=http_client,
+                                                                                         task_id=task_id)
+                                            status = verify_campaign['status']
+                                            logger.info(self.log_message(f"Video: <r>{name}</r> | Status: "
+                                                                         f"<y>{status}</y> Waiting 5s"))
+                                            await asyncio.sleep(random.uniform(4, 6))
+                                            if verify_campaign is not None:
+                                                get_task_by_id = await self.get_task_by_id(http_client=http_client,
+                                                                                           task_id=task_id)
+                                                user_task_id = get_task_by_id['userTaskId']
+                                                status = get_task_by_id['status']
 
-                                            sleep_time_task = max((parser.isoparse(
-                                                get_task_by_id.get('verificationAvailableAt')) - datetime.now(
-                                                timezone.utc)).total_seconds() + 5, randint(5, 15))
+                                                sleep_time_task = max((parser.isoparse(
+                                                    get_task_by_id.get('verificationAvailableAt')) - datetime.now(
+                                                    timezone.utc)).total_seconds() + 5, random.randint(5, 15))
 
-                                            logger.info(f"{self.session_name} "
-                                                        f"| Video: <r>{name}</r> | Status: <y>{status}</y>")
-                                            logger.info(f"{self.session_name} | Waiting {sleep_time_task}s")
-                                            await asyncio.sleep(delay=sleep_time_task)
-                                            if get_task_by_id is not None:
-                                                complete_task = await self.complete_task(http_client=http_client,
-                                                                                         user_task_id=user_task_id)
-                                                status = complete_task['status']
-                                                logger.info(f"{self.session_name} "
-                                                            f"| Video: <r>{name}</r> | Status: <g>{status}</g>")
-                                                await asyncio.sleep(delay=3)
-                                                n += 1
+                                                logger.info(self.log_message(f"Video: <r>{name}</r> | Status: "
+                                                                             f"<y>{status}</y> Waiting {sleep_time_task}s"))
+                                                await asyncio.sleep(delay=sleep_time_task)
+                                                if get_task_by_id is not None:
+                                                    complete_task = await self.complete_task(http_client=http_client,
+                                                                                             user_task_id=user_task_id)
+                                                    status = complete_task['status']
+                                                    logger.info(self.log_message(f"Video: <r>{name}</r> | "
+                                                                                 f"Status: <g>{status}</g>"))
+                                                    await asyncio.sleep(delay=3)
+                                                    n += 1
 
                     spins = profile_data.get('spinEnergyTotal', 0)
                     if settings.ROLL_CASINO:
@@ -871,16 +818,15 @@ class Tapper:
                             else:
                                 eth_lottery_status = play_data.get('ethLotteryConfig', {}).get('isCompleted', 0)
                                 eth_lottery_ticket = play_data.get('ethLotteryConfig', {}).get('ticketNumber', 0)
-                            logger.info(f"{self.session_name} | 🎰 Casino game | "
-                                        f"Balance: <lc>{balance:,}</lc> (<lg>+{reward_amount:,}</lg> "
-                                        f"<lm>{reward_type}</lm>) "
-                                        f"| Spins: <le>{spins:,}</le> ")
+                            logger.info(self.log_message(f"🎰 Casino game | Balance: <lc>{balance:,}</lc> "
+                                                         f"(<lg>+{reward_amount:,}</lg> <lm>{reward_type}</lm>) | "
+                                                         f"Spins: <le>{spins:,}</le> "))
                             if settings.LOTTERY_INFO:
-                                logger.info(f"{self.session_name} | 🎟 ETH Lottery status: {eth_lottery_status} |"
-                                            f" 🎫 Ticket number: <yellow>{eth_lottery_ticket}</yellow>")
+                                logger.info(self.log_message(f"🎟 ETH Lottery status: {eth_lottery_status} | "
+                                                             f"🎫 Ticket number: <ly>{eth_lottery_ticket}</ly>"))
                             await asyncio.sleep(delay=5)
 
-                    taps = randint(a=settings.RANDOM_TAPS_COUNT[0], b=settings.RANDOM_TAPS_COUNT[1])
+                    taps = random.randint(a=settings.RANDOM_TAPS_COUNT[0], b=settings.RANDOM_TAPS_COUNT[1])
                     if taps > boss_current_health:
                         taps = boss_max_health - boss_current_health - 10
                         return taps
@@ -928,11 +874,11 @@ class Tapper:
 
                     if telegramMe['isReferralInitialJoinBonusAvailable'] is True:
                         await self.claim_referral_bonus(http_client=http_client)
-                        logger.info(f"{self.session_name} | 🔥Referral bonus was claimed")
+                        logger.info(self.log_message(f"🔥Referral bonus was claimed"))
 
                     if bot_config['isPurchased'] is False and settings.AUTO_BUY_TAPBOT is True:
                         await self.upgrade_boost(http_client=http_client, boost_type=UpgradableBoostType.TAPBOT)
-                        logger.info(f"{self.session_name} | 👉 Tapbot was purchased - 😴 Sleep 7s")
+                        logger.info(self.log_message(f"👉 Tapbot was purchased - 😴 Sleep 7s"))
                         await asyncio.sleep(delay=9)
                         bot_config = await self.get_bot_config(http_client=http_client)
 
@@ -940,25 +886,25 @@ class Tapper:
                         if bot_config['usedAttempts'] < bot_config['totalAttempts'] and not bot_config['endsAt']:
                             await self.start_bot(http_client=http_client)
                             bot_config = await self.get_bot_config(http_client=http_client)
-                            logger.info(f"{self.session_name} | 👉 Tapbot is started")
+                            logger.info(self.log_message(f"👉 Tapbot is started"))
 
                         else:
                             tapbotClaim = await self.claim_bot(http_client=http_client)
                             if tapbotClaim['isClaimed'] == False and tapbotClaim['data']:
-                                logger.info(
-                                    f"{self.session_name} | 👉 Tapbot was claimed - 😴 Sleep 7s before starting again")
+                                logger.info(self.log_message(f"👉 Tapbot was claimed - 😴 Sleep 7s "
+                                                             f"before starting again"))
                                 await asyncio.sleep(delay=9)
                                 bot_config = tapbotClaim['data']
                                 await asyncio.sleep(delay=5)
 
                                 if bot_config['usedAttempts'] < bot_config['totalAttempts']:
                                     await self.start_bot(http_client=http_client)
-                                    logger.info(f"{self.session_name} | 👉 Tapbot is started - 😴 Sleep 7s")
+                                    logger.info(self.log_message(f"👉 Tapbot is started - 😴 Sleep 7s"))
                                     await asyncio.sleep(delay=9)
                                     bot_config = await self.get_bot_config(http_client=http_client)
 
                     if active_turbo:
-                        taps += randint(a=settings.ADD_TAPS_ON_TURBO[0], b=settings.ADD_TAPS_ON_TURBO[1])
+                        taps += random.randint(a=settings.ADD_TAPS_ON_TURBO[0], b=settings.ADD_TAPS_ON_TURBO[1])
                         if taps > boss_current_health:
                             taps = boss_max_health - boss_current_health - 10
                             return taps
@@ -970,11 +916,12 @@ class Tapper:
                             turbo_time = 0
 
                     if need_energy > available_energy or available_energy - need_energy < settings.MIN_AVAILABLE_ENERGY:
-                        logger.warning(f"{self.session_name} | Need more energy ({available_energy}/{need_energy}, min:"
-                                       f" {settings.MIN_AVAILABLE_ENERGY}) for {taps} taps")
+                        logger.warning(self.log_message(f"Need more energy ({available_energy}/{need_energy}, min:"
+                                                        f" {settings.MIN_AVAILABLE_ENERGY}) for {taps} taps"))
 
-                        sleep_between_clicks = randint(a=settings.SLEEP_BETWEEN_TAP[0], b=settings.SLEEP_BETWEEN_TAP[1])
-                        logger.info(f"Sleep {sleep_between_clicks}s")
+                        sleep_between_clicks = random.randint(a=settings.SLEEP_BETWEEN_TAP[0],
+                                                              b=settings.SLEEP_BETWEEN_TAP[1])
+                        logger.info(self.log_message(f"Sleep {sleep_between_clicks}s"))
                         await asyncio.sleep(delay=sleep_between_clicks)
                         # update profile data
                         profile_data = await self.get_profile_data(http_client=http_client)
@@ -1003,38 +950,35 @@ class Tapper:
                     boss_current_health = current_boss['currentHealth']
 
                     if boss_current_health <= 0:
-                        logger.info(f"{self.session_name} | 👉 Setting next boss: <m>{current_boss_level + 1}</m> lvl")
-                        logger.info(f"{self.session_name} | 😴 Sleep 10s")
+                        logger.info(self.log_message(f"👉 Setting next boss: <m>{current_boss_level + 1}</m> lvl "
+                                                     f"😴 Sleep 10s"))
                         await asyncio.sleep(delay=10)
 
                         status = await self.set_next_boss(http_client=http_client)
                         if status is True:
-                            logger.success(f"{self.session_name} | ✅ Successful setting next boss: "
-                                           f"<m>{current_boss_level + 1}</m>")
+                            logger.success(self.log_message(f"✅ Successful setting next boss: "
+                                                            f"<m>{current_boss_level + 1}</m>"))
 
                     taps_status = await self.send_taps(http_client=http_client, nonce=nonce, taps=taps)
                     taps_new_balance = taps_status['coinsAmount']
                     calc_taps = taps_new_balance - balance
                     if calc_taps > 0:
-                        logger.success(
-                            f"{self.session_name} | ✅ Successful tapped! 🔨 | 👉 Current energy: {available_energy} "
+                        logger.success(self.log_message(
+                            f"✅ Successful tapped! 🔨 | 👉 Current energy: {available_energy} "
                             f"| ⚡️ Minimum energy limit: {settings.MIN_AVAILABLE_ENERGY} | "
                             f"Balance: <c>{taps_new_balance}</c> (<g>+{calc_taps} 😊</g>) | "
-                            f"Boss health: <e>{boss_current_health}</e>")
+                            f"Boss health: <e>{boss_current_health}</e>"))
                         balance = new_balance
                     else:
-                        logger.info(
-                            f"{self.session_name} | ❌ Failed tapped! 🔨 | Balance: <c>{taps_new_balance}</c> "
+                        logger.info(self.log_message(
+                            f"❌ Failed tapped! 🔨 | Balance: <c>{taps_new_balance}</c> "
                             f"(<g>No coin added 😥</g>) | 👉 Current energy: {available_energy} | "
                             f"⚡️ Minimum energy limit: {settings.MIN_AVAILABLE_ENERGY} | "
-                            f"Boss health: <e>{boss_current_health}</e>")
+                            f"Boss health: <e>{boss_current_health}</e>"))
                         balance = new_balance
                         taps_status_json = json.dumps(taps_status)
-                        logger.warning(
-                            f"{self.session_name} | ❌ MemeFi server error 500"
-                        )
-                        #print(f"{self.session_name} | ", json.dumps(taps_status))
-                        logger.info(f"{self.session_name} | 😴 Sleep 10m")
+                        logger.warning(self.log_message(f"❌ MemeFi server error 500"))
+                        logger.info(self.log_message(f"😴 Sleep 10m"))
                         await asyncio.sleep(delay=600)
                         noBalance = True
 
@@ -1043,24 +987,24 @@ class Tapper:
                                 and available_energy < settings.MIN_AVAILABLE_ENERGY
                                 and settings.APPLY_DAILY_ENERGY is True
                                 and available_energy - need_energy < settings.MIN_AVAILABLE_ENERGY):
-                            logger.info(f"{self.session_name} | 😴 Sleep 7s before activating the daily energy boost")
-                            #await asyncio.sleep(delay=9)
+                            logger.info(self.log_message(f"😴 Sleep 7s before activating the daily energy boost"))
+                            # await asyncio.sleep(delay=9)
 
                             status = await self.apply_boost(http_client=http_client, boost_type=FreeBoostType.ENERGY)
                             if status is True:
-                                logger.success(f"{self.session_name} | 👉 Energy boost applied")
+                                logger.success(self.log_message(f"👉 Energy boost applied"))
 
                                 await asyncio.sleep(delay=3)
 
                             continue
 
                         if turbo_boost_count > 0 and settings.APPLY_DAILY_TURBO is True:
-                            logger.info(f"{self.session_name} | 😴 Sleep 10s before activating the daily turbo boost")
+                            logger.info(self.log_message(f"😴 Sleep 10s before activating the daily turbo boost"))
                             await asyncio.sleep(delay=10)
 
                             status = await self.apply_boost(http_client=http_client, boost_type=FreeBoostType.TURBO)
                             if status is True:
-                                logger.success(f"{self.session_name} | 👉 Turbo boost applied")
+                                logger.success(self.log_message(f"👉 Turbo boost applied"))
 
                                 await asyncio.sleep(delay=9)
 
@@ -1075,12 +1019,12 @@ class Tapper:
                                 status = await self.upgrade_boost(http_client=http_client,
                                                                   boost_type=UpgradableBoostType.TAP)
                                 if status is True:
-                                    logger.success(f"{self.session_name} | Tap upgraded to {next_tap_level} lvl")
+                                    logger.success(self.log_message(f"Tap upgraded to {next_tap_level} lvl"))
 
                                     await asyncio.sleep(delay=1)
                             else:
-                                logger.info(f"{self.session_name} | Need more gold for upgrade tap to {next_tap_level}"
-                                            f" lvl ({balance}/{need_balance})")
+                                logger.info(self.log_message(f"Need more gold for upgrade tap to {next_tap_level} "
+                                                             f"lvl ({balance}/{need_balance})"))
 
                         if settings.AUTO_UPGRADE_ENERGY is True and next_energy_level <= settings.MAX_ENERGY_LEVEL:
                             need_balance = 1000 * (2 ** (next_energy_level - 1))
@@ -1088,14 +1032,12 @@ class Tapper:
                                 status = await self.upgrade_boost(http_client=http_client,
                                                                   boost_type=UpgradableBoostType.ENERGY)
                                 if status is True:
-                                    logger.success(f"{self.session_name} | Energy upgraded to {next_energy_level} lvl")
+                                    logger.success(self.log_message(f"Energy upgraded to {next_energy_level} lvl"))
 
                                     await asyncio.sleep(delay=1)
                             else:
-                                logger.warning(
-                                    f"{self.session_name} | Need more gold for upgrade energy to {next_energy_level} "
-                                    f"lvl ({balance}/{need_balance})")
-
+                                logger.warning(self.log_message(f"Need more gold for upgrade energy to "
+                                                                f"{next_energy_level} lvl ({balance}/{need_balance})"))
 
                         if settings.AUTO_UPGRADE_CHARGE is True and next_charge_level <= settings.MAX_CHARGE_LEVEL:
                             need_balance = 1000 * (2 ** (next_charge_level - 1))
@@ -1104,19 +1046,17 @@ class Tapper:
                                 status = await self.upgrade_boost(http_client=http_client,
                                                                   boost_type=UpgradableBoostType.CHARGE)
                                 if status is True:
-                                    logger.success(f"{self.session_name} | Charge upgraded to {next_charge_level} lvl")
+                                    logger.success(self.log_message(f"\Charge upgraded to {next_charge_level} lvl"))
 
                                     await asyncio.sleep(delay=1)
                             else:
-                                logger.warning(
-                                    f"{self.session_name} | Need more gold for upgrade charge to {next_energy_level} "
-                                    f"lvl ({balance}/{need_balance})")
-
+                                logger.warning(self.log_message(
+                                    f"Need more gold for upgrade charge to {next_energy_level} "
+                                    f"lvl ({balance}/{need_balance})"))
 
                         if available_energy < settings.MIN_AVAILABLE_ENERGY:
-                            logger.info(f"{self.session_name} | 👉 Minimum energy reached: {available_energy}")
-                            logger.info(f"{self.session_name} | 😴 Sleep {settings.SLEEP_BY_MIN_ENERGY}s")
-
+                            logger.info(self.log_message(f"👉 Minimum energy reached: {available_energy} | "
+                                                         f"😴 Sleep {settings.SLEEP_BY_MIN_ENERGY}s"))
                             await asyncio.sleep(delay=settings.SLEEP_BY_MIN_ENERGY)
 
                             continue
@@ -1125,26 +1065,27 @@ class Tapper:
                     raise error
 
                 except Exception as error:
-                    logger.error(f"{self.session_name} | ❗️Unknown error: {error}")
-                    logger.info(f"{self.session_name} | 😴 Wait 1h")
+                    log_error(self.log_message(f"❗️Unknown error: {error} | 😴 Wait 1h"))
                     await asyncio.sleep(delay=3600)
 
                 else:
-                    sleep_between_clicks = randint(a=settings.SLEEP_BETWEEN_TAP[0], b=settings.SLEEP_BETWEEN_TAP[1])
+                    sleep_between_clicks = random.randint(a=settings.SLEEP_BETWEEN_TAP[0],
+                                                          b=settings.SLEEP_BETWEEN_TAP[1])
 
                     if active_turbo is True:
                         sleep_between_clicks = 50
                     elif noBalance is True:
                         sleep_between_clicks = 700
 
-                    logger.info(f"{self.session_name} | 😴 Sleep {sleep_between_clicks}s")
+                    logger.info(self.log_message(f"😴 Sleep {sleep_between_clicks}s"))
                     await asyncio.sleep(delay=sleep_between_clicks)
 
 
-async def run_tapper(tg_client: Client, proxy: str | None):
+async def run_tapper(tg_client: TelegramClient):
+    runner = Tapper(tg_client=tg_client)
     try:
-        await Tapper(tg_client=tg_client).run(proxy=proxy)
-    except InvalidSession:
-        logger.error(f"{tg_client.name} | ❗️Invalid Session")
+        await runner.run()
+    except InvalidSession as e:
+        logger.error(runner.log_message(f"Invalid Session: {e}"))
     except InvalidProtocol as error:
         logger.error(f"{tg_client.name} | ❗️Invalid protocol detected at {error}")

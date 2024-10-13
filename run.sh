@@ -1,16 +1,6 @@
 #!/bin/bash
-# thx @AlexKrutoy
 
-#Проверка обновления репозитория
-git pull --allow-unrelated-histories #принудительное обновление
-
-#установка библиотек если такие появились
-pip install -r requirements.txt
-#python3 --version
-
-#dmesg | grep "Linux version"
-
-
+firstRun=true
 
 # Проверка на наличие папки venv
 if [ ! -d "venv" ]; then
@@ -43,8 +33,17 @@ else
 	echo "Skipping .env copying"
 fi
 
-echo "Starting the bot..."
-python3 main.py
+while true
+do
+    git fetch
+    git pull
+    if [ "$firstRun" = true ]; then
+        python3 main.py
+        firstRun=false
+    else
+        python3 main.py -a 1
+    fi
 
-echo "done"
-echo "PLEASE EDIT .ENV FILE"
+    echo "Restarting the program in 10 seconds..."
+    sleep 10
+done

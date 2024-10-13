@@ -1,33 +1,30 @@
 import asyncio
 from contextlib import suppress
+from bot.core.launcher import process
+from bot.utils import PROXY_CHAIN, logger
+from bot.utils.proxy_utils import get_proxy_chain, check_proxy
+from os import system
 
-from bot.utils.launcher import process
-
-import platform
-import sys
-
-def print_versions():
-    # Версия Python
-    python_version = sys.version
-    print(f"Версия Python: {python_version}")
-
-    # Версия системы
-    system = platform.system()
-    release = platform.release()
-
-    if system == "Windows":
-        print(f"Операционная система: {system} {release}")
-    elif system == "Linux":
-        distro = platform.linux_distribution()
-        print(f"Операционная система: {system} {release}")
-        print(f"Дистрибутив Linux: {distro[0]} {distro[1]}")
-    else:
-        print(f"Операционная система: {system} {release}")
 
 async def main():
+    if PROXY_CHAIN:
+        proxy_str, proxy = await get_proxy_chain(PROXY_CHAIN)
+        if proxy:
+            logger.info("Getting proxy for Proxy Chain")
+            if await check_proxy(proxy_str):
+                import socket, socks
+                socks.set_default_proxy(proxy)
+                socket.socket = socks.socksocket
+            else:
+                logger.error("Proxy chain didn't respond. Can't start the bot using proxy chain")
+                input('Press any key to exit: ')
+                exit(0)
+        else:
+            logger.warning("No valid proxy found. Skipping")
     await process()
 
 
 if __name__ == '__main__':
+    system('title MemeFi')
     with suppress(KeyboardInterrupt):
         asyncio.run(main())
