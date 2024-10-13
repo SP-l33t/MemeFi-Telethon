@@ -845,32 +845,32 @@ class Tapper:
                         with open(clancheck_file, 'w') as file:
                             file.write('This file indicates that the script has already run once.')
 
-                    if first_check_clan():
-                        clan = await self.get_clan(http_client=http_client)
-                        set_first_run_check_clan()
-                        await asyncio.sleep(1)
-                        if clan is not False and clan != '71886d3b-1186-452d-8ac6-dcc5081ab204':
-                            await asyncio.sleep(1)
-                            clan_leave = await self.leave_clan(http_client=http_client)
-                            if clan_leave is True:
-                                await asyncio.sleep(1)
-                                clan_join = await self.join_clan(http_client=http_client)
-                                if clan_join is True:
-                                    continue
-                                elif clan_join is False:
-                                    await asyncio.sleep(1)
-                                    continue
-                            elif clan_leave is False:
-                                continue
-                        elif clan == '71886d3b-1186-452d-8ac6-dcc5081ab204':
-                            continue
-                        else:
-                            clan_join = await self.join_clan(http_client=http_client)
-                            if clan_join is True:
-                                continue
-                            elif clan_join is False:
-                                await asyncio.sleep(1)
-                                continue
+                    # if first_check_clan():
+                    #     clan = await self.get_clan(http_client=http_client)
+                    #     set_first_run_check_clan()
+                    #     await asyncio.sleep(1)
+                    #     if clan is not False and clan != '71886d3b-1186-452d-8ac6-dcc5081ab204':
+                    #         await asyncio.sleep(1)
+                    #         clan_leave = await self.leave_clan(http_client=http_client)
+                    #         if clan_leave is True:
+                    #             await asyncio.sleep(1)
+                    #             clan_join = await self.join_clan(http_client=http_client)
+                    #             if clan_join is True:
+                    #                 continue
+                    #             elif clan_join is False:
+                    #                 await asyncio.sleep(1)
+                    #                 continue
+                    #         elif clan_leave is False:
+                    #             continue
+                    #     elif clan == '71886d3b-1186-452d-8ac6-dcc5081ab204':
+                    #         continue
+                    #     else:
+                    #         clan_join = await self.join_clan(http_client=http_client)
+                    #         if clan_join is True:
+                    #             continue
+                    #         elif clan_join is False:
+                    #             await asyncio.sleep(1)
+                    #             continue
 
                     if telegramMe['isReferralInitialJoinBonusAvailable'] is True:
                         await self.claim_referral_bonus(http_client=http_client)
