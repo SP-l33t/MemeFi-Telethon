@@ -1,7 +1,6 @@
 import aiohttp
 import asyncio
 import os
-import random
 import json
 from urllib.parse import unquote, parse_qs
 from aiocfscrape import CloudflareScraper
@@ -9,6 +8,7 @@ from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from datetime import datetime, timezone
 from dateutil import parser
+from random import randint, uniform
 from time import time
 
 from opentele.tl import TelegramClient
@@ -83,9 +83,9 @@ class Tapper:
                 if not self.tg_client.is_connected():
                     await self.tg_client.connect()
                 await self.initialize_webview_data()
-                await asyncio.sleep(random.uniform(1, 2))
+                await asyncio.sleep(uniform(1, 2))
 
-                ref_id = settings.REF_ID if random.randint(0, 100) <= 85 else "r_be864a343c"
+                ref_id = settings.REF_ID if randint(0, 100) <= 85 else "r_be864a343c"
 
                 web_view = await self.tg_client(messages.RequestAppWebViewRequest(
                     **self._webview_data,
@@ -434,7 +434,7 @@ class Tapper:
             for tap in range(taps):
                 """ check if tap is greater than 4 or less than 1 and set tap to random number between 1 and 4"""
                 if tap > 4 or tap < 1:
-                    tap = random.randint(1, 4)
+                    tap = randint(1, 4)
                 vectorArray.append(tap)
 
             vector = ",".join(str(x) for x in vectorArray)
@@ -660,14 +660,14 @@ class Tapper:
                 logger.error(self.log_message(f"Error while completing task: {data['errors'][0]['message']}"))
                 return None
 
-            return data.get('data', {}).get('campaignTaskMarkAsCompleted')
+            return data.get('data', {}).get('campaignTaskMarkAsCompleted', {})
 
         except Exception as e:
             log_error(self.log_message(f"Unknown error while completing task: {str(e)}"))
             return None
 
     async def run(self):
-        random_delay = random.uniform(1, settings.RANDOM_SESSION_START_DELAY)
+        random_delay = uniform(1, settings.RANDOM_SESSION_START_DELAY)
         logger.info(self.log_message(f"Bot will start in <light-red>{int(random_delay)}s</light-red>"))
         await asyncio.sleep(delay=random_delay)
 
@@ -758,7 +758,7 @@ class Tapper:
                         if settings.WATCH_VIDEO:
                             task_json = await self.get_campaigns(http_client=http_client)
                             n = 0
-                            while n < 197:
+                            while n < len(task_json):
                                 campaigns_id = task_json[n]['id']
                                 if task_json is not None:
                                     tasks_list = await self.get_tasks_list(http_client=http_client,
@@ -781,16 +781,18 @@ class Tapper:
                                             status = verify_campaign['status']
                                             logger.info(self.log_message(f"Video: <r>{name}</r> | Status: "
                                                                          f"<y>{status}</y> Waiting 5s"))
-                                            await asyncio.sleep(random.uniform(4, 6))
+                                            await asyncio.sleep(uniform(4, 6))
                                             if verify_campaign is not None:
                                                 get_task_by_id = await self.get_task_by_id(http_client=http_client,
                                                                                            task_id=task_id)
+                                                if not get_task_by_id:
+                                                    continue
                                                 user_task_id = get_task_by_id['userTaskId']
                                                 status = get_task_by_id['status']
 
                                                 sleep_time_task = max((parser.isoparse(
                                                     get_task_by_id.get('verificationAvailableAt')) - datetime.now(
-                                                    timezone.utc)).total_seconds() + 5, random.randint(5, 15))
+                                                    timezone.utc)).total_seconds() + 5, randint(5, 15))
 
                                                 logger.info(self.log_message(f"Video: <r>{name}</r> | Status: "
                                                                              f"<y>{status}</y> Waiting {sleep_time_task}s"))
@@ -798,7 +800,7 @@ class Tapper:
                                                 if get_task_by_id is not None:
                                                     complete_task = await self.complete_task(http_client=http_client,
                                                                                              user_task_id=user_task_id)
-                                                    status = complete_task['status']
+                                                    status = complete_task.get('status')
                                                     logger.info(self.log_message(f"Video: <r>{name}</r> | "
                                                                                  f"Status: <g>{status}</g>"))
                                                     await asyncio.sleep(delay=3)
@@ -827,7 +829,7 @@ class Tapper:
                                                              f"🎫 Ticket number: <ly>{eth_lottery_ticket}</ly>"))
                             await asyncio.sleep(delay=5)
 
-                    taps = random.randint(a=settings.RANDOM_TAPS_COUNT[0], b=settings.RANDOM_TAPS_COUNT[1])
+                    taps = randint(a=settings.RANDOM_TAPS_COUNT[0], b=settings.RANDOM_TAPS_COUNT[1])
                     if taps > boss_current_health:
                         taps = boss_max_health - boss_current_health - 10
                         return taps
@@ -896,7 +898,7 @@ class Tapper:
                                     bot_config = await self.get_bot_config(http_client=http_client)
 
                     if active_turbo:
-                        taps += random.randint(a=settings.ADD_TAPS_ON_TURBO[0], b=settings.ADD_TAPS_ON_TURBO[1])
+                        taps += randint(a=settings.ADD_TAPS_ON_TURBO[0], b=settings.ADD_TAPS_ON_TURBO[1])
                         if taps > boss_current_health:
                             taps = boss_max_health - boss_current_health - 10
                             return taps
@@ -911,7 +913,7 @@ class Tapper:
                         logger.warning(self.log_message(f"Need more energy ({available_energy}/{need_energy}, min:"
                                                         f" {settings.MIN_AVAILABLE_ENERGY}) for {taps} taps"))
 
-                        sleep_between_clicks = random.randint(a=settings.SLEEP_BETWEEN_TAP[0],
+                        sleep_between_clicks = randint(a=settings.SLEEP_BETWEEN_TAP[0],
                                                               b=settings.SLEEP_BETWEEN_TAP[1])
                         logger.info(self.log_message(f"Sleep {sleep_between_clicks}s"))
                         await asyncio.sleep(delay=sleep_between_clicks)
@@ -1064,7 +1066,7 @@ class Tapper:
                     await asyncio.sleep(delay=3600)
 
                 else:
-                    sleep_between_clicks = random.randint(a=settings.SLEEP_BETWEEN_TAP[0],
+                    sleep_between_clicks = randint(a=settings.SLEEP_BETWEEN_TAP[0],
                                                           b=settings.SLEEP_BETWEEN_TAP[1])
 
                     if active_turbo is True:
