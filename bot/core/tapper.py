@@ -165,7 +165,7 @@ class Tapper:
                 response_json = await response.json()
 
                 if 'errors' in response_json:
-                    raise InvalidProtocol(f'get_access_token msg: {response_json["errors"][0]["message"]}')
+                    raise InvalidProtocol(f'get_access_token msg: {response_json["errors"][0]}')
 
                 access_token = response_json.get('data', {}).get('telegramUserLogin', {}).get('access_token', '')
 
@@ -1082,4 +1082,4 @@ async def run_tapper(tg_client: TelegramClient):
     except InvalidSession as e:
         logger.error(runner.log_message(f"Invalid Session: {e}"))
     except InvalidProtocol as error:
-        logger.error(f"{tg_client.name} | ❗️Invalid protocol detected at {error}")
+        logger.error(runner.log_message(f"❗️Invalid protocol detected at {error}"))
