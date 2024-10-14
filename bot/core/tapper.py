@@ -836,15 +836,6 @@ class Tapper:
                     available_energy = profile_data['currentEnergy']
                     need_energy = taps * profile_data['weaponLevel']
 
-                    clancheck_file = 'clancheck.txt'
-
-                    def first_check_clan():
-                        return not os.path.exists(clancheck_file)
-
-                    def set_first_run_check_clan():
-                        with open(clancheck_file, 'w') as file:
-                            file.write('This file indicates that the script has already run once.')
-
                     # if first_check_clan():
                     #     clan = await self.get_clan(http_client=http_client)
                     #     set_first_run_check_clan()
@@ -1063,6 +1054,9 @@ class Tapper:
 
                 except InvalidSession as error:
                     raise error
+
+                except InvalidProtocol:
+                    raise
 
                 except Exception as error:
                     log_error(self.log_message(f"❗️Unknown error: {error} | 😴 Wait 1h"))
