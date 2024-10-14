@@ -104,7 +104,7 @@ class Tapper:
                 start_param = tg_web_data.get('start_param', [''])[0]
                 auth_date = tg_web_data.get('auth_date', [''])[0]
                 hash_value = tg_web_data.get('hash', [''])[0]
-                json_string = json.dumps(user_data, separators=(',', ':'))
+                json_string = json.dumps(user_data, separators=(',', ':'), ensure_ascii=False)
 
                 json_data = {
                     "operationName": OperationName.MutationTelegramUserLogin,
@@ -122,7 +122,8 @@ class Tapper:
                                 "username": user_data.get('username', ''),
                                 "language_code": user_data.get('language_code', 'en')
                             }
-                        }
+                        },
+                        "referralCode": start_param.replace('r_', "")
                     },
                     "query": Query.MutationTelegramUserLogin
                 }
