@@ -29,7 +29,12 @@
 |     Displaying the status and ticket number in the lottery     |     ✅     |
 |            Clear config customization with comments            |     ✅     |
 |                   Performing tasks on video                    |     ✅     |
-|                   Support telethon .session                    |     ✅     |
+|            Supports telethon AND pyrogram .session             |     ✅     |
+
+_Script searches for session files in the following folders:_
+* /sessions
+* /sessions/pyrogram
+* /session/telethon
 
 
 ## [Settings](https://github.com/SP-l33t/MemeFi-Telethon/blob/main/.env-example)
@@ -38,6 +43,7 @@
 |:------------------------------:|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
 |     **API_ID / API_HASH**      |                                                                                             Platform data from which to launch a Telegram session                                                                                             |
 |     **GLOBAL_CONFIG_PATH**     | Specifies the global path for accounts_config, proxies, sessions. <br/>Specify an absolute path or use an environment variable (default environment variable: **TG_FARM**) <br/>If no environment variable exists, uses the script directory. |
+|          **FIX_CERT**          |                                                                                           Try to fix  SSLCertVerificationError ( True / **False** )                                                                                           |
 |    **MIN_AVAILABLE_ENERGY**    |                                                                        Minimum amount of available energy, upon reaching which there will be a delay (default **300**)                                                                        |
 |    **SLEEP_BY_MIN_ENERGY**     |                                                                                           Delay when reaching minimum energy in seconds ( **300** )                                                                                           |
 |     **ADD_TAPS_ON_TURBO**      |                                                                                    How many taps will be added when turbo is activated ( **[500, 1500]** )                                                                                    |

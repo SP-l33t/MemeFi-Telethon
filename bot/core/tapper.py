@@ -1,7 +1,7 @@
 import aiohttp
 import asyncio
-import os
 import json
+import re
 from urllib.parse import unquote, parse_qs
 from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
@@ -11,13 +11,10 @@ from dateutil import parser
 from random import randint, uniform
 from time import time
 
-from opentele.tl import TelegramClient
-from telethon.errors import *
-from telethon.types import InputBotAppShortName, InputUser
-from telethon.functions import messages
+from bot.utils.universal_telegram_client import UniversalTelegramClient
 
 from bot.config import settings
-from bot.utils import logger, log_error, proxy_utils, config_utils, AsyncInterProcessLock, CONFIG_PATH
+from bot.utils import logger, log_error, config_utils, CONFIG_PATH, first_run
 from bot.utils.graphql import Query, OperationName
 from bot.utils.boosts import FreeBoostType, UpgradableBoostType
 from bot.exceptions import InvalidSession, InvalidProtocol
@@ -26,12 +23,9 @@ from .TLS import TLSv1_3_BYPASS
 
 
 class Tapper:
-    def __init__(self, tg_client: TelegramClient):
+    def __init__(self, tg_client: UniversalTelegramClient):
         self.tg_client = tg_client
-        self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        self.lock = AsyncInterProcessLock(
-            os.path.join(os.path.dirname(CONFIG_PATH), 'lock_files', f"{self.session_name}.lock"))
-        self.headers = headers
+        self.session_name = tg_client.session_name
 
         session_config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
 
@@ -39,6 +33,7 @@ class Tapper:
             logger.critical(self.log_message('CHECK accounts_config.json as it might be corrupted'))
             exit(-1)
 
+        self.headers = headers
         user_agent = session_config.get('user_agent')
         self.headers['user-agent'] = user_agent
         self.headers.update(**get_sec_ch_ua(user_agent))
@@ -46,8 +41,7 @@ class Tapper:
         self.proxy = session_config.get('proxy')
         if self.proxy:
             proxy = Proxy.from_str(self.proxy)
-            proxy_dict = proxy_utils.to_telethon_proxy(proxy)
-            self.tg_client.set_proxy(proxy_dict)
+            self.tg_client.set_proxy(proxy)
 
         self.GRAPHQL_URL = 'https://api-gw-tg.memefi.club/graphql'
 
@@ -56,90 +50,44 @@ class Tapper:
     def log_message(self, message) -> str:
         return f"<ly>{self.session_name}</ly> | {message}"
 
-    async def initialize_webview_data(self):
-        if not self._webview_data:
-            while True:
-                try:
-                    peer = await self.tg_client.get_input_entity('memefi_coin_bot')
-                    bot_id = InputUser(user_id=peer.user_id, access_hash=peer.access_hash)
-                    input_bot_app = InputBotAppShortName(bot_id=bot_id, short_name="main")
-                    self._webview_data = {'peer': peer, 'app': input_bot_app}
-                    break
-                except FloodWaitError as fl:
-                    logger.warning(self.log_message(f"FloodWait {fl}. Waiting {fl.seconds}s"))
-                    await asyncio.sleep(fl.seconds + 3)
-                except (UnauthorizedError, AuthKeyUnregisteredError):
-                    raise InvalidSession(f"{self.session_name}: User is unauthorized")
-                except (UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError):
-                    raise InvalidSession(f"{self.session_name}: User is banned")
-
     async def get_tg_web_data(self):
-        if self.proxy and not self.tg_client._proxy:
-            logger.critical(self.log_message('Proxy found, but not passed to TelegramClient'))
-            exit(-1)
-        json_data = ""
-        async with self.lock:
-            try:
-                if not self.tg_client.is_connected():
-                    await self.tg_client.connect()
-                await self.initialize_webview_data()
-                await asyncio.sleep(uniform(1, 2))
+        webview_url = await self.tg_client.get_app_webview_url('memefi_coin_bot', "main", "r_be864a343c")
 
-                ref_id = settings.REF_ID if randint(0, 100) <= 85 else "r_be864a343c"
+        tg_web_data = parse_qs(unquote(
+            webview_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0]))
 
-                web_view = await self.tg_client(messages.RequestAppWebViewRequest(
-                    **self._webview_data,
-                    platform='android',
-                    write_allowed=True,
-                    start_param=ref_id
-                ))
+        user_data = json.loads(tg_web_data.get('user', [''])[0])
+        chat_instance = tg_web_data.get('chat_instance', [''])[0]
+        chat_type = tg_web_data.get('chat_type', [''])[0]
+        start_param = tg_web_data.get('start_param', [''])[0]
+        auth_date = tg_web_data.get('auth_date', [''])[0]
+        hash_value = tg_web_data.get('hash', [''])[0]
+        json_string = json.dumps(user_data, separators=(',', ':'), ensure_ascii=False)
 
-                auth_url = web_view.url
-                tg_web_data = parse_qs(unquote(
-                    auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0]))
+        start_param_str = f"\nstart_param={start_param}" if start_param else ""
+        referral_code = {"referralCode": start_param.replace('r_', "")} if start_param else {}
 
-                user_data = json.loads(tg_web_data.get('user', [''])[0])
-                chat_instance = tg_web_data.get('chat_instance', [''])[0]
-                chat_type = tg_web_data.get('chat_type', [''])[0]
-                start_param = tg_web_data.get('start_param', [''])[0]
-                auth_date = tg_web_data.get('auth_date', [''])[0]
-                hash_value = tg_web_data.get('hash', [''])[0]
-                json_string = json.dumps(user_data, separators=(',', ':'), ensure_ascii=False)
-
-                json_data = {
-                    "operationName": OperationName.MutationTelegramUserLogin,
-                    "variables": {
-                        "webAppData": {
-                            "auth_date": int(auth_date),
-                            "hash": hash_value,
-                            "query_id": "",
-                            "checkDataString": f'auth_date={auth_date}\nchat_instance={chat_instance}\nchat_type={chat_type}\nstart_param={start_param}\nuser={json_string}',
-                            "user": {
-                                "id": user_data['id'],
-                                "allows_write_to_pm": user_data['allows_write_to_pm'],
-                                "first_name": user_data['first_name'],
-                                "last_name": user_data.get('last_name', ''),
-                                "username": user_data.get('username', ''),
-                                "language_code": user_data.get('language_code', 'en')
-                            }
-                        },
-                        "referralCode": start_param.replace('r_', "")
-                    },
-                    "query": Query.MutationTelegramUserLogin
-                }
-                # with open('out.txt', 'w+') as file:
-                #     json.dump(json_data, file)
-            except InvalidSession:
-                raise
-
-            except Exception as error:
-                log_error(self.log_message(f"Unknown error during Authorization: {type(error).__name__}"))
-                await asyncio.sleep(delay=3)
-
-            finally:
-                if self.tg_client.is_connected():
-                    await self.tg_client.disconnect()
-                    await asyncio.sleep(15)
+        json_data = {
+            "operationName": OperationName.MutationTelegramUserLogin,
+            "variables": {
+                "webAppData": {
+                    "auth_date": int(auth_date),
+                    "hash": hash_value,
+                    "query_id": "",
+                    "checkDataString": f'auth_date={auth_date}\nchat_instance={chat_instance}\nchat_type={chat_type}{start_param_str}\nuser={json_string}',
+                    "user": {
+                        "id": user_data['id'],
+                        "allows_write_to_pm": user_data['allows_write_to_pm'],
+                        "first_name": user_data['first_name'],
+                        "last_name": user_data.get('last_name', ''),
+                        "username": user_data.get('username', ''),
+                        "language_code": user_data.get('language_code', 'en')
+                    }
+                },
+                **referral_code
+            },
+            "query": Query.MutationTelegramUserLogin
+        }
 
         return json_data
 
@@ -702,6 +650,9 @@ class Tapper:
                             await asyncio.sleep(delay=5)
                             continue
 
+                        if self.tg_client.is_fist_run:
+                            await first_run.append_recurring_session(self.session_name)
+
                         http_client.headers["Authorization"] = f"Bearer {access_token}"
 
                         access_token_created_time = time()
@@ -1078,7 +1029,7 @@ class Tapper:
                     await asyncio.sleep(delay=sleep_between_clicks)
 
 
-async def run_tapper(tg_client: TelegramClient):
+async def run_tapper(tg_client: UniversalTelegramClient):
     runner = Tapper(tg_client=tg_client)
     try:
         await runner.run()
